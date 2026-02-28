@@ -52,6 +52,7 @@ type Pattern struct {
 	ServerExceptions []string `json:"serverExceptions,omitempty"`  // IPv4 списка исключений
 
 	BanType string `json:"banType,omitempty"` // WEBHOOK | FIRST_IP_WEBHOOK_AFTER
+	UserIdType string `json:"userIdType,omitempty"` // EMAIL | IP
 }
 
 const (
@@ -99,6 +100,7 @@ type Alert struct {
 	Sample        string
 	BanType  string
 	BannedIP string
+	UserIdType string
 }
 
 type WebhookPayload struct {
@@ -112,6 +114,7 @@ type WebhookPayload struct {
 	Sample        string `json:"sample,omitempty"`
 
 	BanType       string `json:"banType,omitempty"`
+	UserIdType string `json:"userIdType,omitempty"` // EMAIL | IP
 	BannedIP      string `json:"bannedIp,omitempty"`
 	FirewallType  string `json:"firewallType,omitempty"`
 	FirewallOk    *bool  `json:"firewallOk,omitempty"`
@@ -244,12 +247,30 @@ func handleLine(cfgValue *atomic.Value, alertsCh chan<- Alert, line string) {
 			continue
 		}
 
-		userID, ok := extractUserID(p, line)
-		if !ok {
-			continue
+		srcIP := ""
+		needIP := (strings.ToUpper(strings.TrimSpace(p.UserIdType)) == "IP") ||
+				(strings.ToUpper(strings.TrimSpace(p.BanType)) == BanTypeFirstIPWebhookAfter)
+
+		if needIP {
+			if ip, ok := extractSourceIPv4(line); ok {
+				srcIP = ip
+			}
 		}
 
-		srcIP, _ := extractSourceIPv4(line)
+		var userID string
+		if strings.ToUpper(strings.TrimSpace(p.UserIdType)) == "IP" {
+			if srcIP == "" {
+				// без IP нельзя определить уникальность — пропускаем
+				continue
+			}
+			userID = srcIP
+		} else {
+			uid, ok := extractUserID(p, line)
+			if !ok {
+				continue
+			}
+			userID = uid
+		}
 
 		if alert := p.observe(userID, now, srcIP, line); alert != nil {
 			select {
@@ -359,6 +380,14 @@ func compileConfig(rc RemoteConfig, serverIPv4 string) (*compiledConfig, error) 
 			bt = BanTypeWebhook
 		}
 		p.BanType = bt
+		uit := strings.ToUpper(strings.TrimSpace(p.UserIdType))
+		if uit == "" {
+			uit = "EMAIL"
+		}
+		if uit != "EMAIL" && uit != "IP" {
+			uit = "EMAIL"
+		}
+		p.UserIdType = uit
 
 		cp := &compiledPattern{
 			Pattern:     p,
@@ -388,26 +417,30 @@ func compileConfig(rc RemoteConfig, serverIPv4 string) (*compiledConfig, error) 
 			cp.matchRe = re
 		}
 
-		switch strings.ToLower(strings.TrimSpace(p.Extract.Type)) {
-		case "after":
-			if strings.TrimSpace(p.Extract.After) == "" {
-				log.Printf("pattern %q: extract.after is empty", p.ID)
+		if p.UserIdType != "IP" {
+			switch strings.ToLower(strings.TrimSpace(p.Extract.Type)) {
+			case "after":
+				if strings.TrimSpace(p.Extract.After) == "" {
+					log.Printf("pattern %q: extract.after is empty", p.ID)
+					continue
+				}
+			case "regex":
+				if strings.TrimSpace(p.Extract.Regex) == "" || p.Extract.Group <= 0 {
+					log.Printf("pattern %q: extract.regex/group invalid", p.ID)
+					continue
+				}
+				re, err := regexp.Compile(p.Extract.Regex)
+				if err != nil {
+					log.Printf("pattern %q: bad extract.regex: %v", p.ID, err)
+					continue
+				}
+				cp.extractRe = re
+			default:
+				log.Printf("pattern %q: extract.type must be 'after' or 'regex'", p.ID)
 				continue
 			}
-		case "regex":
-			if strings.TrimSpace(p.Extract.Regex) == "" || p.Extract.Group <= 0 {
-				log.Printf("pattern %q: extract.regex/group invalid", p.ID)
-				continue
-			}
-			re, err := regexp.Compile(p.Extract.Regex)
-			if err != nil {
-				log.Printf("pattern %q: bad extract.regex: %v", p.ID, err)
-				continue
-			}
-			cp.extractRe = re
-		default:
-			log.Printf("pattern %q: extract.type must be 'after' or 'regex'", p.ID)
-			continue
+		} else {
+
 		}
 
 		out.Patterns = append(out.Patterns, cp)
@@ -533,6 +566,7 @@ func (p *compiledPattern) observe(userID string, now int64, srcIP string, line s
 					Count:         p.threshold,
 					WindowSeconds: int(p.windowSec),
 					ObservedAt:    time.Unix(now, 0).UTC(),
+					UserIdType:    p.UserIdType,
 				}
 				alert.BanType = p.BanType
 				if p.BanType == BanTypeFirstIPWebhookAfter {
@@ -618,6 +652,7 @@ func webhookWorker(ctx context.Context, url, token, node string, timeout time.Du
 				Count:         a.Count,
 				WindowSeconds: a.WindowSeconds,
 				ObservedAt:    a.ObservedAt.Format(time.RFC3339Nano),
+				UserIdType:    a.UserIdType,
 			}
 			if banType != "" {
 				payload.BanType = banType
