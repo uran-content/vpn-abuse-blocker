@@ -40,6 +40,7 @@ type Pattern struct {
 	MustContain []string    `json:"mustContain"`
 	MatchRegex  string      `json:"matchRegex,omitempty"`
 	Extract     ExtractRule `json:"extract"`
+	DestExtract ExtractRule `json:"destExtract,omitempty"`
 
 	Threshold       int `json:"threshold"`
 	WindowSeconds   int `json:"windowSeconds"`
@@ -52,7 +53,7 @@ type Pattern struct {
 	ServerExceptions []string `json:"serverExceptions,omitempty"`  // IPv4 списка исключений
 
 	BanType string `json:"banType,omitempty"` // WEBHOOK | FIRST_IP_WEBHOOK_AFTER
-	UserIdType string `json:"userIdType,omitempty"` // EMAIL | IP
+	UserIdType string `json:"userIdType,omitempty"` // EMAIL | IP | IPorEMAIL
 }
 
 const (
@@ -70,8 +71,10 @@ type compiledConfig struct {
 type compiledPattern struct {
 	Pattern
 
-	matchRe   *regexp.Regexp
-	extractRe *regexp.Regexp
+	matchRe       *regexp.Regexp
+	extractRe     *regexp.Regexp
+	destExtractRe *regexp.Regexp
+	hasDestExtract bool
 
 	states map[string]*userState
 
@@ -101,6 +104,7 @@ type Alert struct {
 	BanType  string
 	BannedIP string
 	UserIdType string
+	Destination string
 }
 
 type WebhookPayload struct {
@@ -114,11 +118,12 @@ type WebhookPayload struct {
 	Sample        string `json:"sample,omitempty"`
 
 	BanType       string `json:"banType,omitempty"`
-	UserIdType string `json:"userIdType,omitempty"` // EMAIL | IP
+	UserIdType string `json:"userIdType,omitempty"` // EMAIL | IP | IPorEMAIL
 	BannedIP      string `json:"bannedIp,omitempty"`
 	FirewallType  string `json:"firewallType,omitempty"`
 	FirewallOk    *bool  `json:"firewallOk,omitempty"`
 	FirewallError string `json:"firewallError,omitempty"`
+	Destination   string `json:"destination,omitempty"`
 }
 
 func main() {
@@ -247,9 +252,11 @@ func handleLine(cfgValue *atomic.Value, alertsCh chan<- Alert, line string) {
 			continue
 		}
 
+		uit := p.UserIdType // already uppercased in compileConfig
+
 		srcIP := ""
-		needIP := (strings.ToUpper(strings.TrimSpace(p.UserIdType)) == "IP") ||
-				(strings.ToUpper(strings.TrimSpace(p.BanType)) == BanTypeFirstIPWebhookAfter)
+		needIP := uit == "IP" || uit == "IPOREMAIL" ||
+			p.BanType == BanTypeFirstIPWebhookAfter
 
 		if needIP {
 			if ip, ok := extractSourceIPv4(line); ok {
@@ -257,26 +264,80 @@ func handleLine(cfgValue *atomic.Value, alertsCh chan<- Alert, line string) {
 			}
 		}
 
-		var userID string
-		if strings.ToUpper(strings.TrimSpace(p.UserIdType)) == "IP" {
+		// Extract destination if destExtract is configured
+		destination := ""
+		if p.hasDestExtract {
+			if d, ok := extractDest(p, line); ok {
+				destination = d
+			} else {
+				continue // can't extract destination — skip
+			}
+		}
+
+		sendAlert := func(alert *Alert) {
+			if alert == nil {
+				return
+			}
+			alert.Destination = destination
+			select {
+			case alertsCh <- *alert:
+			default:
+			}
+		}
+
+		switch uit {
+		case "IP":
 			if srcIP == "" {
-				// без IP нельзя определить уникальность — пропускаем
 				continue
 			}
-			userID = srcIP
-		} else {
+			key := srcIP
+			if destination != "" {
+				key = srcIP + "|" + destination
+			}
+			if alert := p.observe(key, now, srcIP, line); alert != nil {
+				alert.UserID = srcIP
+				sendAlert(alert)
+			}
+
+		case "IPOREMAIL":
+			// Observe for both email and IP separately.
+			// If either reaches the threshold, trigger.
+			var sent bool
+			email, emailOk := extractUserID(p, line)
+			if emailOk && email != "" {
+				key := email
+				if destination != "" {
+					key = email + "|" + destination
+				}
+				if alert := p.observe(key, now, srcIP, line); alert != nil {
+					alert.UserID = email
+					sendAlert(alert)
+					sent = true
+				}
+			}
+			if !sent && srcIP != "" {
+				key := "ip:" + srcIP
+				if destination != "" {
+					key = "ip:" + srcIP + "|" + destination
+				}
+				if alert := p.observe(key, now, srcIP, line); alert != nil {
+					alert.UserID = srcIP
+					sendAlert(alert)
+				}
+			}
+
+		default: // EMAIL
 			uid, ok := extractUserID(p, line)
 			if !ok {
 				continue
 			}
-			userID = uid
-		}
-
-		if alert := p.observe(userID, now, srcIP, line); alert != nil {
-			select {
-			case alertsCh <- *alert:
-			default:
-				// Дропаем при перегрузке — защита CPU/RAM
+			key := uid
+			if destination != "" {
+				key = uid + "|" + destination
+			}
+			if alert := p.observe(key, now, srcIP, line); alert != nil {
+				alert.UserID = uid
+				sendAlert(alert)
 			}
 		}
 	}
@@ -345,6 +406,26 @@ func fetchAndCompile(ctx context.Context, client *http.Client, url, token string
 		return err
 	}
 
+	// Carry over accumulated user states from old patterns to new ones (matched by ID).
+	// Without this, every poll cycle resets all in-progress tracking.
+	if prev, _ := cfgValue.Load().(*compiledConfig); prev != nil {
+		oldByID := make(map[string]*compiledPattern, len(prev.Patterns))
+		for _, op := range prev.Patterns {
+			if op != nil {
+				oldByID[op.ID] = op
+			}
+		}
+		for _, np := range compiled.Patterns {
+			if np == nil {
+				continue
+			}
+			if op, ok := oldByID[np.ID]; ok {
+				np.states = op.states
+				np.lastCleanup = op.lastCleanup
+			}
+		}
+	}
+
 	cfgValue.Store(compiled)
 	log.Printf("loaded %d pattern(s)", len(compiled.Patterns))
 	return nil
@@ -384,7 +465,7 @@ func compileConfig(rc RemoteConfig, serverIPv4 string) (*compiledConfig, error) 
 		if uit == "" {
 			uit = "EMAIL"
 		}
-		if uit != "EMAIL" && uit != "IP" {
+		if uit != "EMAIL" && uit != "IP" && uit != "IPOREMAIL" {
 			uit = "EMAIL"
 		}
 		p.UserIdType = uit
@@ -439,8 +520,34 @@ func compileConfig(rc RemoteConfig, serverIPv4 string) (*compiledConfig, error) 
 				log.Printf("pattern %q: extract.type must be 'after' or 'regex'", p.ID)
 				continue
 			}
-		} else {
+		}
 
+		// Compile destExtract if provided (for identical-request detection)
+		destType := strings.ToLower(strings.TrimSpace(p.DestExtract.Type))
+		if destType != "" {
+			switch destType {
+			case "after":
+				if strings.TrimSpace(p.DestExtract.After) == "" {
+					log.Printf("pattern %q: destExtract.after is empty", p.ID)
+					continue
+				}
+				cp.hasDestExtract = true
+			case "regex":
+				if strings.TrimSpace(p.DestExtract.Regex) == "" || p.DestExtract.Group <= 0 {
+					log.Printf("pattern %q: destExtract.regex/group invalid", p.ID)
+					continue
+				}
+				re, err := regexp.Compile(p.DestExtract.Regex)
+				if err != nil {
+					log.Printf("pattern %q: bad destExtract.regex: %v", p.ID, err)
+					continue
+				}
+				cp.destExtractRe = re
+				cp.hasDestExtract = true
+			default:
+				log.Printf("pattern %q: destExtract.type must be 'after' or 'regex'", p.ID)
+				continue
+			}
 		}
 
 		out.Patterns = append(out.Patterns, cp)
@@ -461,8 +568,7 @@ func containsAll(s string, needles []string) bool {
 	return true
 }
 
-func extractUserID(p *compiledPattern, line string) (string, bool) {
-	r := p.Extract
+func extractField(r ExtractRule, re *regexp.Regexp, line string) (string, bool) {
 	switch strings.ToLower(strings.TrimSpace(r.Type)) {
 	case "after":
 		idx := strings.Index(line, r.After)
@@ -500,10 +606,10 @@ func extractUserID(p *compiledPattern, line string) (string, bool) {
 		return v, v != ""
 
 	case "regex":
-		if p.extractRe == nil {
+		if re == nil {
 			return "", false
 		}
-		m := p.extractRe.FindStringSubmatch(line)
+		m := re.FindStringSubmatch(line)
 		if m == nil {
 			return "", false
 		}
@@ -517,6 +623,14 @@ func extractUserID(p *compiledPattern, line string) (string, bool) {
 	default:
 		return "", false
 	}
+}
+
+func extractUserID(p *compiledPattern, line string) (string, bool) {
+	return extractField(p.Extract, p.extractRe, line)
+}
+
+func extractDest(p *compiledPattern, line string) (string, bool) {
+	return extractField(p.DestExtract, p.destExtractRe, line)
 }
 
 func (p *compiledPattern) observe(userID string, now int64, srcIP string, line string) *Alert {
@@ -663,6 +777,9 @@ func webhookWorker(ctx context.Context, url, token, node string, timeout time.Du
 			}
 			if a.Sample != "" {
 				payload.Sample = a.Sample
+			}
+			if a.Destination != "" {
+				payload.Destination = a.Destination
 			}
 
 			body, _ := json.Marshal(payload)
