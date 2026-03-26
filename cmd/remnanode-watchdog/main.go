@@ -55,7 +55,8 @@ type Pattern struct {
 	BanType string `json:"banType,omitempty"` // WEBHOOK | FIRST_IP_WEBHOOK_AFTER
 	UserIdType string `json:"userIdType,omitempty"` // EMAIL | IP | IPorEMAIL
 
-	BurstAllowance int `json:"burstAllowance,omitempty"` // number of threshold breaches to absorb before alerting (0 = fire immediately)
+	BurstAllowance        int `json:"burstAllowance,omitempty"`        // number of threshold breaches to absorb before alerting (0 = fire immediately)
+	BurstIntervalSeconds  int `json:"burstIntervalSeconds,omitempty"`  // seconds to wait after absorbing a burst before re-evaluating (default = windowSeconds)
 }
 
 const (
@@ -80,22 +81,24 @@ type compiledPattern struct {
 
 	states map[string]*userState
 
-	lastCleanup    int64
-	ttlSeconds     int64
-	windowSec      int64
-	cooldownSec    int64
-	threshold      int
-	maxUsers       int
-	burstAllowance int
+	lastCleanup      int64
+	ttlSeconds       int64
+	windowSec        int64
+	cooldownSec      int64
+	threshold        int
+	maxUsers         int
+	burstAllowance   int
+	burstIntervalSec int64
 }
 
 type userState struct {
 	times []int64
 	ips   []string
 
-	lastTrigger int64
-	lastSeen    int64
-	burstHits   int // how many cooldown-separated threshold breaches absorbed so far
+	lastTrigger    int64
+	lastSeen       int64
+	lastBurstAbsorb int64 // last time a burst was silently absorbed
+	burstHits      int    // how many threshold breaches absorbed so far
 }
 
 type Alert struct {
@@ -501,17 +504,26 @@ func compileConfig(rc RemoteConfig, serverIPv4 string) (*compiledConfig, error) 
 			burstAllowance: p.BurstAllowance,
 		}
 
+		// burstIntervalSeconds: how long to wait after absorbing a burst
+		// before re-evaluating. Defaults to windowSeconds (the detection window).
+		if p.BurstIntervalSeconds > 0 {
+			cp.burstIntervalSec = int64(p.BurstIntervalSeconds)
+		} else {
+			cp.burstIntervalSec = cp.windowSec
+		}
+
 		if p.MaxTrackedUsers > 0 {
 			cp.maxUsers = p.MaxTrackedUsers
 		} else {
 			cp.maxUsers = 20000
 		}
 
-		burstMultiplier := int64(1)
+		// TTL: keep user state alive long enough for burst cycle + cooldown
+		burstDuration := int64(0)
 		if cp.burstAllowance > 0 {
-			burstMultiplier = int64(cp.burstAllowance + 1)
+			burstDuration = cp.burstIntervalSec * int64(cp.burstAllowance+1)
 		}
-		cp.ttlSeconds = cp.windowSec + cp.cooldownSec*burstMultiplier + 120
+		cp.ttlSeconds = cp.windowSec + cp.cooldownSec + burstDuration + 120
 		if cp.ttlSeconds < 180 {
 			cp.ttlSeconds = 180
 		}
@@ -701,22 +713,34 @@ func (p *compiledPattern) observe(userID string, now int64, srcIP string, line s
 		if now-st.times[0] <= p.windowSec {
 			if p.cooldownSec == 0 || now-st.lastTrigger >= p.cooldownSec {
 				// Burst allowance: absorb the first N threshold breaches
-				// before actually firing an alert. Each absorbed breach
-				// still starts the cooldown timer, so each "burst" is a
-				// cooldown-separated event. If the user goes quiet for
-				// cooldown × (burstAllowance+1), the burst counter resets.
+				// before firing. Uses burstIntervalSec (short) as the
+				// gap between burst evaluations — NOT cooldownSec.
+				// cooldownSec only gates real alerts.
 				if p.burstAllowance > 0 {
-					resetWindow := p.cooldownSec * int64(p.burstAllowance+1)
-					if st.lastTrigger > 0 && now-st.lastTrigger > resetWindow {
+					// Reset burst counter if the user was quiet long enough.
+					resetWindow := p.burstIntervalSec * int64(p.burstAllowance+1)
+					ref := st.lastBurstAbsorb
+					if ref == 0 {
+						ref = st.lastTrigger
+					}
+					if ref > 0 && now-ref > resetWindow {
 						st.burstHits = 0
 					}
+
+					// Don't re-evaluate until burstIntervalSec has passed
+					// since the last absorbed burst.
+					if st.lastBurstAbsorb > 0 && now-st.lastBurstAbsorb < p.burstIntervalSec {
+						return nil
+					}
+
 					if st.burstHits < p.burstAllowance {
 						st.burstHits++
-						st.lastTrigger = now
+						st.lastBurstAbsorb = now
 						return nil // absorb this burst
 					}
 					// burstHits >= burstAllowance → fall through and fire
 					st.burstHits = 0
+					st.lastBurstAbsorb = 0
 				}
 
 				st.lastTrigger = now
