@@ -301,28 +301,46 @@ func handleLine(cfgValue *atomic.Value, alertsCh chan<- Alert, line string) {
 
 		case "IPOREMAIL":
 			// Observe for both email and IP separately.
-			// If either reaches the threshold, trigger.
+			// If either reaches the threshold, trigger — but only ONE
+			// notification per case. When one counter fires, we put
+			// the partner counter into cooldown so it won't fire a
+			// duplicate alert for the same abuse burst.
 			var sent bool
 			email, emailOk := extractUserID(p, line)
+			var emailKey, ipKey string
 			if emailOk && email != "" {
-				key := email
+				emailKey = email
 				if destination != "" {
-					key = email + "|" + destination
+					emailKey = email + "|" + destination
 				}
-				if alert := p.observe(key, now, srcIP, line); alert != nil {
+			}
+			if srcIP != "" {
+				ipKey = "ip:" + srcIP
+				if destination != "" {
+					ipKey = "ip:" + srcIP + "|" + destination
+				}
+			}
+
+			if emailKey != "" {
+				if alert := p.observe(emailKey, now, srcIP, line); alert != nil {
 					alert.UserID = email
 					sendAlert(alert)
 					sent = true
+					// Suppress the partner IP counter so it does not
+					// fire a second notification for the same case.
+					if ipKey != "" {
+						p.suppressPartner(ipKey, now)
+					}
 				}
 			}
-			if !sent && srcIP != "" {
-				key := "ip:" + srcIP
-				if destination != "" {
-					key = "ip:" + srcIP + "|" + destination
-				}
-				if alert := p.observe(key, now, srcIP, line); alert != nil {
+			if !sent && ipKey != "" {
+				if alert := p.observe(ipKey, now, srcIP, line); alert != nil {
 					alert.UserID = srcIP
 					sendAlert(alert)
+					// Suppress the partner email counter.
+					if emailKey != "" {
+						p.suppressPartner(emailKey, now)
+					}
 				}
 			}
 
@@ -699,6 +717,16 @@ func (p *compiledPattern) observe(userID string, now int64, srcIP string, line s
 	}
 
 	return nil
+}
+
+// suppressPartner sets lastTrigger on the partner key's state so that its
+// cooldown prevents a duplicate alert for the same IPorEMAIL abuse burst.
+// If the partner key has no state yet, nothing to suppress.
+func (p *compiledPattern) suppressPartner(partnerKey string, now int64) {
+	st := p.states[partnerKey]
+	if st != nil {
+		st.lastTrigger = now
+	}
 }
 
 func (p *compiledPattern) cleanup(now int64) {
