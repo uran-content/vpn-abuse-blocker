@@ -54,6 +54,8 @@ type Pattern struct {
 
 	BanType string `json:"banType,omitempty"` // WEBHOOK | FIRST_IP_WEBHOOK_AFTER
 	UserIdType string `json:"userIdType,omitempty"` // EMAIL | IP | IPorEMAIL
+
+	BurstAllowance int `json:"burstAllowance,omitempty"` // number of threshold breaches to absorb before alerting (0 = fire immediately)
 }
 
 const (
@@ -78,12 +80,13 @@ type compiledPattern struct {
 
 	states map[string]*userState
 
-	lastCleanup int64
-	ttlSeconds  int64
-	windowSec   int64
-	cooldownSec int64
-	threshold   int
-	maxUsers    int
+	lastCleanup    int64
+	ttlSeconds     int64
+	windowSec      int64
+	cooldownSec    int64
+	threshold      int
+	maxUsers       int
+	burstAllowance int
 }
 
 type userState struct {
@@ -92,6 +95,7 @@ type userState struct {
 
 	lastTrigger int64
 	lastSeen    int64
+	burstHits   int // how many cooldown-separated threshold breaches absorbed so far
 }
 
 type Alert struct {
@@ -489,11 +493,12 @@ func compileConfig(rc RemoteConfig, serverIPv4 string) (*compiledConfig, error) 
 		p.UserIdType = uit
 
 		cp := &compiledPattern{
-			Pattern:     p,
-			states:      make(map[string]*userState, 1024),
-			windowSec:   int64(p.WindowSeconds),
-			cooldownSec: int64(p.CooldownSeconds),
-			threshold:   p.Threshold,
+			Pattern:        p,
+			states:         make(map[string]*userState, 1024),
+			windowSec:      int64(p.WindowSeconds),
+			cooldownSec:    int64(p.CooldownSeconds),
+			threshold:      p.Threshold,
+			burstAllowance: p.BurstAllowance,
 		}
 
 		if p.MaxTrackedUsers > 0 {
@@ -502,7 +507,11 @@ func compileConfig(rc RemoteConfig, serverIPv4 string) (*compiledConfig, error) 
 			cp.maxUsers = 20000
 		}
 
-		cp.ttlSeconds = cp.windowSec + cp.cooldownSec + 120
+		burstMultiplier := int64(1)
+		if cp.burstAllowance > 0 {
+			burstMultiplier = int64(cp.burstAllowance + 1)
+		}
+		cp.ttlSeconds = cp.windowSec + cp.cooldownSec*burstMultiplier + 120
 		if cp.ttlSeconds < 180 {
 			cp.ttlSeconds = 180
 		}
@@ -691,6 +700,25 @@ func (p *compiledPattern) observe(userID string, now int64, srcIP string, line s
 	if len(st.times) == p.threshold {
 		if now-st.times[0] <= p.windowSec {
 			if p.cooldownSec == 0 || now-st.lastTrigger >= p.cooldownSec {
+				// Burst allowance: absorb the first N threshold breaches
+				// before actually firing an alert. Each absorbed breach
+				// still starts the cooldown timer, so each "burst" is a
+				// cooldown-separated event. If the user goes quiet for
+				// cooldown × (burstAllowance+1), the burst counter resets.
+				if p.burstAllowance > 0 {
+					resetWindow := p.cooldownSec * int64(p.burstAllowance+1)
+					if st.lastTrigger > 0 && now-st.lastTrigger > resetWindow {
+						st.burstHits = 0
+					}
+					if st.burstHits < p.burstAllowance {
+						st.burstHits++
+						st.lastTrigger = now
+						return nil // absorb this burst
+					}
+					// burstHits >= burstAllowance → fall through and fire
+					st.burstHits = 0
+				}
+
 				st.lastTrigger = now
 				alert := &Alert{
 					PatternID:     p.ID,
