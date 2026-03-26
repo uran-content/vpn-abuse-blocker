@@ -52,7 +52,7 @@ type Pattern struct {
 	ServerPolicy     string   `json:"serverPolicy,omitempty"`      // DEFAULT_APPLY | DEFAULT_SKIP
 	ServerExceptions []string `json:"serverExceptions,omitempty"`  // IPv4 списка исключений
 
-	BanType string `json:"banType,omitempty"` // WEBHOOK | FIRST_IP_WEBHOOK_AFTER
+	BanType string `json:"banType,omitempty"` // WEBHOOK | FIRST_IP_WEBHOOK_AFTER | FIRST_IP_WEBHOOK_AUTO_BAN
 	UserIdType string `json:"userIdType,omitempty"` // EMAIL | IP | IPorEMAIL
 
 	BurstAllowance        int `json:"burstAllowance,omitempty"`        // number of threshold breaches to absorb before alerting (0 = fire immediately)
@@ -65,7 +65,12 @@ const (
 
 	BanTypeWebhook              = "WEBHOOK"
 	BanTypeFirstIPWebhookAfter  = "FIRST_IP_WEBHOOK_AFTER"
+	BanTypeFirstIPWebhookAutoBan = "FIRST_IP_WEBHOOK_AUTO_BAN"
 )
+
+func banTypeNeedsIP(bt string) bool {
+	return bt == BanTypeFirstIPWebhookAfter || bt == BanTypeFirstIPWebhookAutoBan
+}
 
 type compiledConfig struct {
 	Patterns []*compiledPattern
@@ -263,7 +268,8 @@ func handleLine(cfgValue *atomic.Value, alertsCh chan<- Alert, line string) {
 
 		srcIP := ""
 		needIP := uit == "IP" || uit == "IPOREMAIL" ||
-			p.BanType == BanTypeFirstIPWebhookAfter
+			p.BanType == BanTypeFirstIPWebhookAfter ||
+			p.BanType == BanTypeFirstIPWebhookAutoBan
 
 		if needIP {
 			if ip, ok := extractSourceIPv4(line); ok {
@@ -482,7 +488,7 @@ func compileConfig(rc RemoteConfig, serverIPv4 string) (*compiledConfig, error) 
 		if bt == "" {
 			bt = BanTypeWebhook
 		}
-		if bt != BanTypeWebhook && bt != BanTypeFirstIPWebhookAfter {
+		if bt != BanTypeWebhook && bt != BanTypeFirstIPWebhookAfter && bt != BanTypeFirstIPWebhookAutoBan {
 			bt = BanTypeWebhook
 		}
 		p.BanType = bt
@@ -690,7 +696,7 @@ func (p *compiledPattern) observe(userID string, now int64, srcIP string, line s
 			return nil
 		}
 		st = &userState{times: make([]int64, 0, p.threshold)}
-		if p.BanType == BanTypeFirstIPWebhookAfter {
+		if banTypeNeedsIP(p.BanType) {
 			st.ips = make([]string, 0, p.threshold)
 		}
 		p.states[userID] = st
@@ -699,12 +705,12 @@ func (p *compiledPattern) observe(userID string, now int64, srcIP string, line s
 	st.lastSeen = now
 
 	st.times = append(st.times, now)
-	if p.BanType == BanTypeFirstIPWebhookAfter {
+	if banTypeNeedsIP(p.BanType) {
 		st.ips = append(st.ips, srcIP)
 	}
 	if len(st.times) > p.threshold {
 		st.times = st.times[len(st.times)-p.threshold:]
-		if p.BanType == BanTypeFirstIPWebhookAfter && len(st.ips) > p.threshold {
+		if banTypeNeedsIP(p.BanType) && len(st.ips) > p.threshold {
 			st.ips = st.ips[len(st.ips)-p.threshold:]
 		}
 	}
@@ -753,7 +759,7 @@ func (p *compiledPattern) observe(userID string, now int64, srcIP string, line s
 					UserIdType:    p.UserIdType,
 				}
 				alert.BanType = p.BanType
-				if p.BanType == BanTypeFirstIPWebhookAfter {
+				if banTypeNeedsIP(p.BanType) {
 					if len(st.ips) == p.threshold && st.ips[0] != "" {
 						alert.BannedIP = st.ips[0]
 					} else {
@@ -823,7 +829,7 @@ func webhookWorker(ctx context.Context, url, token, node string, timeout time.Du
 			var fwOkPtr *bool
 			var fwErr string
 
-			if a.BanType == BanTypeFirstIPWebhookAfter {
+			if banTypeNeedsIP(a.BanType) {
 				banType = a.BanType
 				bannedIP = a.BannedIP
 				fwType = "nftables"
