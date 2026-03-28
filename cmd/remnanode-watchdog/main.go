@@ -57,6 +57,8 @@ type Pattern struct {
 
 	BurstAllowance        int `json:"burstAllowance,omitempty"`        // number of threshold breaches to absorb before alerting (0 = fire immediately)
 	BurstIntervalSeconds  int `json:"burstIntervalSeconds,omitempty"`  // seconds to wait after absorbing a burst before re-evaluating (default = windowSeconds)
+
+	NftBanDuration string `json:"nftBanDuration,omitempty"` // nftables element timeout: "30m", "24h", "168h" etc. Empty or "0" = permanent.
 }
 
 const (
@@ -113,10 +115,11 @@ type Alert struct {
 	WindowSeconds int
 	ObservedAt    time.Time
 	Sample        string
-	BanType  string
-	BannedIP string
-	UserIdType string
-	Destination string
+	BanType        string
+	BannedIP       string
+	NftBanDuration string
+	UserIdType     string
+	Destination    string
 }
 
 type WebhookPayload struct {
@@ -129,12 +132,13 @@ type WebhookPayload struct {
 	ObservedAt    string `json:"observedAt"`
 	Sample        string `json:"sample,omitempty"`
 
-	BanType       string `json:"banType,omitempty"`
-	UserIdType string `json:"userIdType,omitempty"` // EMAIL | IP | IPorEMAIL
-	BannedIP      string `json:"bannedIp,omitempty"`
-	FirewallType  string `json:"firewallType,omitempty"`
-	FirewallOk    *bool  `json:"firewallOk,omitempty"`
-	FirewallError string `json:"firewallError,omitempty"`
+	BanType        string `json:"banType,omitempty"`
+	UserIdType     string `json:"userIdType,omitempty"` // EMAIL | IP | IPorEMAIL
+	BannedIP       string `json:"bannedIp,omitempty"`
+	NftBanDuration string `json:"nftBanDuration,omitempty"` // "30m", "24h" etc. or "" = permanent
+	FirewallType   string `json:"firewallType,omitempty"`
+	FirewallOk     *bool  `json:"firewallOk,omitempty"`
+	FirewallError  string `json:"firewallError,omitempty"`
 	Destination   string `json:"destination,omitempty"`
 }
 
@@ -765,6 +769,7 @@ func (p *compiledPattern) observe(userID string, now int64, srcIP string, line s
 					} else {
 						alert.BannedIP = srcIP
 					}
+					alert.NftBanDuration = p.NftBanDuration
 				}
 				if p.IncludeSample {
 					alert.Sample = line
@@ -836,7 +841,7 @@ func webhookWorker(ctx context.Context, url, token, node string, timeout time.Du
 
 				ok, errText := false, "banner not configured"
 				if banner != nil && bannedIP != "" {
-					ok, errText = banner.BanIPv4(ctx, bannedIP)
+					ok, errText = banner.BanIPv4(ctx, bannedIP, a.NftBanDuration)
 				}
 				fwOkPtr = &ok
 				if errText != "" {
@@ -857,6 +862,7 @@ func webhookWorker(ctx context.Context, url, token, node string, timeout time.Du
 			if banType != "" {
 				payload.BanType = banType
 				payload.BannedIP = bannedIP
+				payload.NftBanDuration = a.NftBanDuration
 				payload.FirewallType = fwType
 				payload.FirewallOk = fwOkPtr
 				payload.FirewallError = fwErr
@@ -1262,7 +1268,10 @@ func NewFirewallBanner(cmdTemplate string, timeout, dedupTTL time.Duration) *Fir
 	}
 }
 
-func (b *FirewallBanner) BanIPv4(parent context.Context, ip string) (bool, string) {
+// BanIPv4 adds the IP to the nftables ban set.
+// nftBanDuration is an nft-compatible timeout string ("30m", "24h", "168h").
+// Empty or "0" means permanent (no timeout on the element).
+func (b *FirewallBanner) BanIPv4(parent context.Context, ip string, nftBanDuration string) (bool, string) {
 	parsed := net.ParseIP(strings.TrimSpace(ip))
 	if parsed == nil || parsed.To4() == nil || isPrivateIPv4(parsed.To4()) {
 		return false, "invalid or private ip"
@@ -1283,7 +1292,13 @@ func (b *FirewallBanner) BanIPv4(parent context.Context, ip string) (bool, strin
 		return false, "NFT_BAN_CMD is empty"
 	}
 
-	cmdLine := strings.ReplaceAll(b.cmdTemplate, "%IP%", ip)
+	// Build the element value: either "1.2.3.4 timeout 30m" or just "1.2.3.4"
+	elemValue := ip
+	dur := strings.TrimSpace(nftBanDuration)
+	if dur != "" && dur != "0" {
+		elemValue = ip + " timeout " + dur
+	}
+	cmdLine := strings.ReplaceAll(b.cmdTemplate, "%IP%", elemValue)
 	args, err := splitCommand(cmdLine)
 	if err != nil || len(args) == 0 {
 		return false, "bad NFT_BAN_CMD"
@@ -1447,8 +1462,10 @@ func (b *FirewallBanner) EnsureNftables(parent context.Context) (bool, string) {
 	// 2) Set
 	if out, err := runNftWithTimeout(parent, ensureTimeout, tmpl.prefix, "list", "set", family, table, setName); err != nil {
 		if nftLooksMissing(out) {
-			// nft add set inet remnaguard blocked_ipv4 { type ipv4_addr; flags interval; }
-			args := []string{"add", "set", family, table, setName, "{", "type", addrType + ";", "flags", "interval;", "}"}
+			// nft add set inet remnaguard blocked_ipv4 { type ipv4_addr; flags interval,timeout; }
+			// "timeout" flag allows per-element timeouts for timed bans;
+			// permanent elements simply omit "timeout" in the element itself.
+			args := []string{"add", "set", family, table, setName, "{", "type", addrType + ";", "flags", "interval,timeout;", "}"}
 			out2, err2 := runNftWithTimeout(parent, ensureTimeout, tmpl.prefix, args...)
 			if err2 != nil && !nftLooksExists(out2) {
 				return false, fmt.Sprintf("create set failed: %v: %s", err2, out2)
